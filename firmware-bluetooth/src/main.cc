@@ -62,7 +62,7 @@ struct report_type {
 struct descriptor_type {
     uint16_t size;
     uint8_t conn_idx;
-    uint8_t data[512];
+    uint8_t data[1024];
 };
 
 struct hogp_ready_type {
@@ -391,6 +391,12 @@ static void button_cb(const struct device* dev, struct gpio_callback* cb, uint32
     }
 }
 
+static void mtu_exchange_cb(struct bt_conn* conn, uint8_t err, struct bt_gatt_exchange_params* params) {
+    LOG_INF("MTU exchange %s, MTU=%u", err ? "failed" : "done", bt_gatt_get_mtu(conn));
+}
+
+static struct bt_gatt_exchange_params mtu_exchange_params[CONFIG_BT_MAX_CONN];
+
 static void connected(struct bt_conn* conn, uint8_t conn_err) {
     char addr[BT_ADDR_LE_STR_LEN];
 
@@ -408,6 +414,10 @@ static void connected(struct bt_conn* conn, uint8_t conn_err) {
     }
 
     LOG_INF("%s", addr);
+
+    // Without this the ATT MTU stays at 23 and notifications longer than 20 bytes get truncated.
+    mtu_exchange_params[bt_conn_index(conn)].func = mtu_exchange_cb;
+    CHK(bt_gatt_exchange_mtu(conn, &mtu_exchange_params[bt_conn_index(conn)]));
 
     CHK(bt_conn_set_security(conn, BT_SECURITY_L2));
 }
@@ -503,11 +513,18 @@ static uint8_t hogp_notify_cb(struct bt_hogp* hogp, struct bt_hogp_rep_info* rep
     }
 
     static struct report_type buf;
+    size_t size = bt_hogp_rep_size(rep);
+    if (size > sizeof(buf.data) - 1) {
+        LOG_WRN("report ID %u too long (%u bytes), truncating", bt_hogp_rep_id(rep), size);
+        size = sizeof(buf.data) - 1;
+    }
     buf.interface = hogp_index(hogp) << 8;
-    buf.len = bt_hogp_rep_size(rep) + 1;
+    buf.len = size + 1;
     buf.data[0] = bt_hogp_rep_id(rep);
 
-    memcpy(buf.data + 1, data, buf.len);
+    memcpy(buf.data + 1, data, size);
+
+    LOG_HEXDUMP_DBG(buf.data, buf.len, "report (first byte = report ID from Report Reference)");
     if (k_msgq_put(&report_q, &buf, K_NO_WAIT)) {
         //        printk("error in k_msg_put(report_q\n");
     }
@@ -519,7 +536,21 @@ static uint8_t hogp_notify_cb(struct bt_hogp* hogp, struct bt_hogp_rep_info* rep
 static struct descriptor_type their_descriptor;
 
 static void hogp_map_read_cb(struct bt_hogp* hogp, uint8_t err, const uint8_t* data, size_t size, size_t offset) {
-    if (data == NULL) {
+    if (err) {
+        LOG_ERR("report map read failed: err=%u, offset=%u", err, offset);
+    }
+
+    bool too_long = (data != NULL) && (offset + size > sizeof(their_descriptor.data));
+    if (too_long) {
+        LOG_ERR("report map longer than %u bytes, truncating", sizeof(their_descriptor.data));
+    }
+
+    if ((data == NULL) || too_long) {
+        if (too_long) {
+            memcpy(their_descriptor.data + offset, data, sizeof(their_descriptor.data) - offset);
+            offset = sizeof(their_descriptor.data);
+        }
+        LOG_INF("report map read done, %u bytes", offset);
         their_descriptor.size = offset;
         their_descriptor.conn_idx = hogp_index(hogp);
         CHK(k_msgq_put(&descriptor_q, &their_descriptor, K_NO_WAIT));
@@ -562,6 +593,7 @@ static void hogp_ready_work_fn(struct k_work* work) {
         device_connected_callback(bt_conn_index(bt_hogp_conn(item.hogp)) << 8, 1, 1, find_bond.found_idx);
 
         while (NULL != (rep = bt_hogp_rep_next(item.hogp, rep))) {
+            LOG_INF("report characteristic: ID=%u type=%u", bt_hogp_rep_id(rep), bt_hogp_rep_type(rep));
             if (bt_hogp_rep_type(rep) == BT_HIDS_REPORT_TYPE_INPUT) {
                 LOG_DBG("subscribing to report ID: %u", bt_hogp_rep_id(rep));
                 CHK(bt_hogp_rep_subscribe(item.hogp, rep, hogp_notify_cb));
@@ -927,7 +959,19 @@ int main() {
 
     while (true) {
         if (!process_pending && !k_msgq_get(&report_q, &incoming_report, K_NO_WAIT)) {
-            handle_received_report(incoming_report.data, incoming_report.len, (uint16_t) incoming_report.interface);
+            const uint8_t* report_data = incoming_report.data;
+            uint8_t report_len = incoming_report.len;
+            if (incoming_report.interface != OUR_OUT_INTERFACE) {
+                // Bluetooth reports are queued with the report ID (from the Report Reference
+                // descriptor) prepended. If the device's report map doesn't use report IDs,
+                // that byte must not be treated as part of the report.
+                auto search = has_report_id_theirs.find(incoming_report.interface);
+                if ((search != has_report_id_theirs.end()) && !search->second && (report_len > 0)) {
+                    report_data++;
+                    report_len--;
+                }
+            }
+            handle_received_report(report_data, report_len, (uint16_t) incoming_report.interface);
             process_pending = true;
         }
         if (atomic_test_and_clear_bit(tick_pending, 0)) {
@@ -972,7 +1016,12 @@ int main() {
 
         while (!k_msgq_get(&descriptor_q, &incoming_descriptor, K_NO_WAIT)) {
             LOG_HEXDUMP_DBG(incoming_descriptor.data, incoming_descriptor.size, "incoming_descriptor");
-            parse_descriptor(1, 1, incoming_descriptor.data, incoming_descriptor.size, incoming_descriptor.conn_idx << 8, 0);
+            uint16_t parsed_interface = incoming_descriptor.conn_idx << 8;
+            parse_descriptor(1, 1, incoming_descriptor.data, incoming_descriptor.size, parsed_interface, 0);
+            LOG_INF("report map parsed: %u bytes, uses report IDs: %d", incoming_descriptor.size, (int) has_report_id_theirs[parsed_interface]);
+            for (auto const& [report_id, usage_map] : their_usages[parsed_interface]) {
+                LOG_INF("  input report ID %u: %u usages", report_id, usage_map.size());
+            }
         }
 
         if (resume_pending) {
