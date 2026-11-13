@@ -21,7 +21,10 @@ jobs:
           docker run -v $PWD:/workdir/project -w /workdir/project/firmware-bluetooth nordicplayground/nrfconnect-sdk:v2.2-branch \
             west build -b ${{ matrix.board }}
           cp firmware-bluetooth/build/zephyr/remapper.uf2 firmware-bluetooth/remapper_${{ matrix.board }}.uf2
+          docker run -v $PWD:/workdir/project -w /workdir/project/firmware-bluetooth nordicplayground/nrfconnect-sdk:v2.2-branch \
+            west build -b ${{ matrix.board }} -d build_debug -- -DOVERLAY_CONFIG=debug.conf -DDTC_OVERLAY_FILE=debug.overlay
+          cp firmware-bluetooth/build_debug/zephyr/remapper.uf2 firmware-bluetooth/remapper_${{ matrix.board }}_debug.uf2
       - uses: actions/upload-artifact@v7
         with:
           name: artifact-${{ matrix.board }}
-          path: firmware-bluetooth/remapper_${{ matrix.board }}.uf2
+          path: firmware-bluetooth/remapper_${{ matrix.board }}*.uf2
